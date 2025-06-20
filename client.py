@@ -15,6 +15,12 @@ class Clerk:
 
         # Your definitions here.
 
+        self.current_server = 0
+
+        self.client_id = nrand()
+        self.seq_num = 0
+        self.last_successful_op = 0
+
     # Fetch the current value for a key.
     # Returns "" if the key does not exist.
     # Keeps trying forever in the face of all other errors.
@@ -28,7 +34,23 @@ class Clerk:
     # arguments in server.py.
     def get(self, key: str) -> str:
         # You will have to modify this function.
-        return ""
+
+        op_id = self.seq_num
+        self.seq_num += 1
+        
+        args = GetArgs(key)
+        args.client_id = self.client_id
+        args.operation_id = op_id
+        args.last_operation_id = self.last_successful_op
+
+        while True:
+            try:
+                reply = self.servers[self.current_server].call("KVServer.Get", args)
+                self.last_successful_op = op_id
+                return reply.value
+            except TimeoutError:
+                # Try next server
+                self.current_server = (self.current_server + 1) % len(self.servers)
 
     # Shared by Put and Append.
     #
@@ -41,7 +63,22 @@ class Clerk:
     # arguments in server.py.
     def put_append(self, key: str, value: str, op: str) -> str:
         # You will have to modify this function.
-        return ""
+
+        op_id = self.seq_num
+        self.seq_num += 1
+        
+        args = PutAppendArgs(key, value)
+        args.client_id = self.client_id
+        args.operation_id = op_id
+        args.last_operation_id = self.last_successful_op
+
+        while True:
+            try:
+                reply = self.servers[self.current_server].call("KVServer." + op, args)
+                self.last_successful_op = op_id
+                return reply.value
+            except TimeoutError:
+                self.current_server = (self.current_server + 1) % len(self.servers)
 
     def put(self, key: str, value: str):
         self.put_append(key, value, "Put")
