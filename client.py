@@ -13,8 +13,19 @@ class Clerk:
         # Your definitions here.
         self.current_server = 0
 
-        # Use id(self) for deterministic, unique client ID
-        self.client_id = id(self)
+        # Generate a globally-unique Clerk ID (object ids can be reused)
+        global _client_id_counter, _client_id_lock
+        try:
+            _client_id_lock
+        except NameError:
+            import threading
+            _client_id_lock = threading.Lock()
+            _client_id_counter = 0
+
+        with _client_id_lock:
+            self.client_id = _client_id_counter
+            _client_id_counter += 1
+        
         self.seq_num = 0
         self.last_successful_op = 0
         
@@ -26,23 +37,21 @@ class Clerk:
             self.nshards = len(servers)
         
         self.nreplicas = getattr(cfg, 'nreplicas', 1)
+        self.total_servers = len(servers)
         
-        print(f"Client init: nshards={self.nshards}, nreplicas={self.nreplicas}, nservers={len(servers)}")
+        print(f"Client init: nshards={self.nshards}, nreplicas={self.nreplicas}, nservers={self.total_servers}")
 
-    def _shard_id(self, key: str) -> int:
-        """Calculate shard ID for a key using int(key) % nshards."""
+    def _get_shard_id(self, key: str) -> int:
+        """Calculate shard ID for a key using int(key) % nshards (same as server logic)."""
         try:
             shard_id = int(key) % self.nshards
         except ValueError:
             shard_id = hash(key) % self.nshards
         return shard_id
 
-    def _replica_group(self, shard_id: int) -> List[int]:
-        """Get the replica group for a shard using [(shard_id + i) % len(servers) for i in range(nreplicas)]."""
-        replica_group = []
-        for i in range(self.nreplicas):
-            replica_server = (shard_id + i) % len(self.servers)
-            replica_group.append(replica_server)
+    def _get_replica_group(self, shard_id: int) -> List[int]:
+        """Get the replica group for a shard using [(shard_id + i) % total_servers for i in range(nreplicas)] (same as server logic)."""
+        replica_group = [(shard_id + i) % self.total_servers for i in range(self.nreplicas)]
         return replica_group
 
     def next_op_id(self) -> int:
@@ -69,13 +78,14 @@ class Clerk:
         args.operation_id = op_id
         args.last_operation_id = self.last_successful_op
         
-        # Calculate shard ID and replica group
-        shard_id = self._shard_id(key)
-        replica_group = self._replica_group(shard_id)
+        # Calculate shard ID and replica group using same logic as server
+        shard_id = self._get_shard_id(key)
+        replica_group = self._get_replica_group(shard_id)
         
         # Retry logic: try each server in replica group, then retry entire process
-        max_retries = 10
-        for retry_attempt in range(max_retries):
+        max_retries = 10000  # Set a maximum retry limit
+        retries = 0
+        while retries < max_retries:
             for server_id in replica_group:
                 try:
                     reply = self.servers[server_id].call("KVServer.Get", args)
@@ -92,14 +102,15 @@ class Clerk:
                     raise
                 except Exception as e:
                     # If it's "Not primary" error or any other error, try next server
+                    if "Not primary" in str(e):
+                        continue
+                    # For other exceptions, also try next server
                     continue
             
             # If all servers in replica group failed, sleep and retry
-            if retry_attempt < max_retries - 1:
-                time.sleep(0.05)
-        
-        # If all retries failed, raise an exception (don't return empty string)
-        raise Exception("All replica servers failed for shard")
+            time.sleep(0.05)
+            retries += 1
+        raise TimeoutError("Max retries reached")
 
     # Shared by Put and Append.
     #
@@ -117,13 +128,12 @@ class Clerk:
         args.operation_id = op_id
         args.last_operation_id = self.last_successful_op
         
-        # Calculate shard ID and replica group
-        shard_id = self._shard_id(key)
-        replica_group = self._replica_group(shard_id)
+        # Calculate shard ID and replica group using same logic as server
+        shard_id = self._get_shard_id(key)
+        replica_group = self._get_replica_group(shard_id)
         
         # Retry logic: try each server in replica group, then retry entire process
-        max_retries = 10
-        for retry_attempt in range(max_retries):
+        while True:
             for server_id in replica_group:
                 try:
                     reply = self.servers[server_id].call("KVServer." + op, args)
@@ -140,14 +150,13 @@ class Clerk:
                     raise
                 except Exception as e:
                     # If it's "Not primary" error or any other error, try next server
+                    if "Not primary" in str(e):
+                        continue
+                    # For other exceptions, also try next server
                     continue
             
             # If all servers in replica group failed, sleep and retry
-            if retry_attempt < max_retries - 1:
-                time.sleep(0.05)
-        
-        # If all retries failed, raise an exception (don't return empty string)
-        raise Exception("All replica servers failed for shard")
+            time.sleep(0.05)
 
     def put(self, key: str, value: str):
         return self.put_append(key, value, "Put")
