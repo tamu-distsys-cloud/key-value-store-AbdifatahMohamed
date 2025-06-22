@@ -2,12 +2,9 @@ import logging
 import threading
 from typing import Tuple, Any, List
 
-debugging = False
-
-# Use this function for debugging
-def debug(format, *args):
-    if debugging:
-        logging.info(format % args)
+#used LLM to debug and fix the code for last couple of tests. 
+#Faced difficulty in shard implementation which lead to errors in the code. 
+#Used LLM to help me understand the code and fix the errors.
 
 # Global counter for server IDs
 _server_id_counter = 0

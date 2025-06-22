@@ -5,6 +5,10 @@ from typing import Any, List
 from labrpc.labrpc import ClientEnd
 from server import GetArgs, GetReply, PutAppendArgs, PutAppendReply
 
+#used LLM to debug and fix the code for last couple of tests. 
+#Faced difficulty in shard implementation which lead to errors in the code. 
+#Used LLM to help me understand the code and fix the errors. 
+
 class Clerk:
     def __init__(self, servers: List[ClientEnd], cfg):
         self.servers = servers
