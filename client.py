@@ -1,12 +1,9 @@
-import random
 import threading
+import time
 from typing import Any, List
 
 from labrpc.labrpc import ClientEnd
 from server import GetArgs, GetReply, PutAppendArgs, PutAppendReply
-
-def nrand() -> int:
-    return random.getrandbits(62)
 
 class Clerk:
     def __init__(self, servers: List[ClientEnd], cfg):
@@ -14,36 +11,45 @@ class Clerk:
         self.cfg = cfg
 
         # Your definitions here.
-
         self.current_server = 0
 
-        self.client_id = nrand()
+        # Use id(self) for deterministic, unique client ID
+        self.client_id = id(self)
         self.seq_num = 0
         self.last_successful_op = 0
         
-        # Sharding setup
-        self.nshards = getattr(cfg, 'nshards', len(servers))
+        # Sharding setup - use the config's nshards if available, otherwise infer from servers
+        if hasattr(cfg, 'nshards'):
+            self.nshards = cfg.nshards
+        else:
+            # If no nshards specified, assume single shard per server
+            self.nshards = len(servers)
+        
         self.nreplicas = getattr(cfg, 'nreplicas', 1)
         
         print(f"Client init: nshards={self.nshards}, nreplicas={self.nreplicas}, nservers={len(servers)}")
 
-    def _get_shard_and_replicas(self, key: str) -> tuple:
-        """Calculate shard ID and get replica servers for a key."""
-        # Calculate shard ID
+    def _shard_id(self, key: str) -> int:
+        """Calculate shard ID for a key using int(key) % nshards."""
         try:
             shard_id = int(key) % self.nshards
         except ValueError:
             shard_id = hash(key) % self.nshards
-        
-        # Get replica servers for this shard
-        # Server i replicates to [i, i+1, ..., i+R-1] (wrapping around)
-        replica_servers = []
+        return shard_id
+
+    def _replica_group(self, shard_id: int) -> List[int]:
+        """Get the replica group for a shard using [(shard_id + i) % len(servers) for i in range(nreplicas)]."""
+        replica_group = []
         for i in range(self.nreplicas):
             replica_server = (shard_id + i) % len(self.servers)
-            replica_servers.append(replica_server)
-        
-        print(f"Client: Key {key} -> shard {shard_id}, replicas {replica_servers}")
-        return shard_id, replica_servers
+            replica_group.append(replica_server)
+        return replica_group
+
+    def next_op_id(self) -> int:
+        """Get the next operation ID and increment."""
+        op_id = self.seq_num
+        self.seq_num += 1
+        return op_id
 
     # Fetch the current value for a key.
     # Returns "" if the key does not exist.
@@ -57,53 +63,43 @@ class Clerk:
     # must match the declared types of the RPC handler function's
     # arguments in server.py.
     def get(self, key: str) -> str:
-        # You will have to modify this function.
-
-        op_id = self.seq_num
-        self.seq_num += 1
-        
+        op_id = self.next_op_id()
         args = GetArgs(key)
         args.client_id = self.client_id
         args.operation_id = op_id
         args.last_operation_id = self.last_successful_op
-
-        # Get shard and replica servers for this key
-        shard_id, replica_servers = self._get_shard_and_replicas(key)
         
-        # Check if this is an unreliable network
-        is_unreliable = hasattr(self.cfg, 'net') and not self.cfg.net.reliable
+        # Calculate shard ID and replica group
+        shard_id = self._shard_id(key)
+        replica_group = self._replica_group(shard_id)
         
-        # Try each replica server in the shard's replica group
-        for server_id in replica_servers:
-            print(f"Client: Trying server {server_id} for key {key}")
-            try:
-                reply = self.servers[server_id].call("KVServer.Get", args)
-                self.last_successful_op = op_id
-                return reply.value
-            except Exception as e:
-                # Try next replica server
-                print(f"Client: Server {server_id} failed for key {key}, shard {shard_id}: {e}")
-                continue
-        
-        # If all replicas failed and this is an unreliable network, retry
-        if is_unreliable:
-            import time
-            retry_count = 0
-            while retry_count < 50:  # Limit retries
-                print(f"Client: All servers failed for key {key}, shard {shard_id}, retrying... (attempt {retry_count + 1})")
-                time.sleep(0.01)
-                for server_id in replica_servers:
-                    try:
-                        reply = self.servers[server_id].call("KVServer.Get", args)
+        # Retry logic: try each server in replica group, then retry entire process
+        max_retries = 10
+        for retry_attempt in range(max_retries):
+            for server_id in replica_group:
+                try:
+                    reply = self.servers[server_id].call("KVServer.Get", args)
+                    if reply is not None:
                         self.last_successful_op = op_id
                         return reply.value
-                    except Exception as e:
+                    # If reply is None, continue to next server
+                    continue
+                except KeyError as e:
+                    # Shard not owned by this server, try next server
+                    if "not owned" in str(e):
                         continue
-                retry_count += 1
+                    # Re-raise other KeyErrors
+                    raise
+                except Exception as e:
+                    # If it's "Not primary" error or any other error, try next server
+                    continue
+            
+            # If all servers in replica group failed, sleep and retry
+            if retry_attempt < max_retries - 1:
+                time.sleep(0.05)
         
-        # If all replicas failed, return empty string
-        print(f"Client: All servers failed for key {key}, shard {shard_id}")
-        return ""
+        # If all retries failed, raise an exception (don't return empty string)
+        raise Exception("All replica servers failed for shard")
 
     # Shared by Put and Append.
     #
@@ -114,54 +110,44 @@ class Clerk:
     # The types of args and reply (including whether they are pointers)
     # must match the declared types of the RPC handler function's
     # arguments in server.py.
-    def put_append(self, key: str, value: str, op: str) -> str:
-        # You will have to modify this function.
-
-        op_id = self.seq_num
-        self.seq_num += 1
-        
+    def put_append(self, key: str, value: str, op: str):
+        op_id = self.next_op_id()
         args = PutAppendArgs(key, value)
         args.client_id = self.client_id
         args.operation_id = op_id
         args.last_operation_id = self.last_successful_op
-
-        # Get shard and replica servers for this key
-        shard_id, replica_servers = self._get_shard_and_replicas(key)
         
-        # Check if this is an unreliable network
-        is_unreliable = hasattr(self.cfg, 'net') and not self.cfg.net.reliable
+        # Calculate shard ID and replica group
+        shard_id = self._shard_id(key)
+        replica_group = self._replica_group(shard_id)
         
-        # Try each replica server in the shard's replica group
-        for server_id in replica_servers:
-            print(f"Client: Trying server {server_id} for {op} key {key}")
-            try:
-                reply = self.servers[server_id].call("KVServer." + op, args)
-                self.last_successful_op = op_id
-                return reply.value
-            except Exception as e:
-                # Try next replica server
-                print(f"Client: Server {server_id} failed for {op} key {key}, shard {shard_id}: {e}")
-                continue
-        
-        # If all replicas failed and this is an unreliable network, retry
-        if is_unreliable:
-            import time
-            retry_count = 0
-            while retry_count < 50:  # Limit retries
-                print(f"Client: All servers failed for {op} key {key}, shard {shard_id}, retrying... (attempt {retry_count + 1})")
-                time.sleep(0.01)
-                for server_id in replica_servers:
-                    try:
-                        reply = self.servers[server_id].call("KVServer." + op, args)
+        # Retry logic: try each server in replica group, then retry entire process
+        max_retries = 10
+        for retry_attempt in range(max_retries):
+            for server_id in replica_group:
+                try:
+                    reply = self.servers[server_id].call("KVServer." + op, args)
+                    if reply is not None:
                         self.last_successful_op = op_id
                         return reply.value
-                    except Exception as e:
+                    # If reply is None, continue to next server
+                    continue
+                except KeyError as e:
+                    # Shard not owned by this server, try next server
+                    if "not owned" in str(e):
                         continue
-                retry_count += 1
+                    # Re-raise other KeyErrors
+                    raise
+                except Exception as e:
+                    # If it's "Not primary" error or any other error, try next server
+                    continue
+            
+            # If all servers in replica group failed, sleep and retry
+            if retry_attempt < max_retries - 1:
+                time.sleep(0.05)
         
-        # If all replicas failed, return empty string for consistency
-        print(f"Client: All servers failed for {op} key {key}, shard {shard_id}")
-        return ""
+        # If all retries failed, raise an exception (don't return empty string)
+        raise Exception("All replica servers failed for shard")
 
     def put(self, key: str, value: str):
         return self.put_append(key, value, "Put")
